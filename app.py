@@ -1,192 +1,212 @@
 import os
-import threading
+import logging
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import pytz
-from flask import Flask
-from pymongo import MongoClient
-import time
 
-# -----------------------------
-# Config
-# -----------------------------
-BOT_USERNAME = "kushagraonly"  # not strictly needed for polling, but kept for clarity
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+from flask import Flask
+from apscheduler.schedulers.background import BackgroundScheduler
+from pymongo import MongoClient
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes
+)
+
+# ---------------- CONFIG ---------------- #
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 
-if not TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN")
-if not MONGO_URI:
-    raise RuntimeError("Missing MONGO_URI")
+if not BOT_TOKEN or not MONGO_URI:
+    raise RuntimeError("Missing BOT_TOKEN or MONGO_URI")
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
-
-# MongoDB setup
+# Mongo setup
 client = MongoClient(MONGO_URI)
 db = client["hmt_tracker"]
 users_col = db["users"]
 
-# Flask app for self-ping
+# Flask app for keep-alive
 app = Flask(__name__)
-
 
 @app.route("/")
 def home():
-    return "✅ HMT Tracker Bot is running!"
+    return "Bot is alive", 200
 
+# Logging
+logging.basicConfig(level=logging.INFO)
 
-@app.route("/ping")
-def ping():
-    return "pong"
+# ---------------- HELPERS ---------------- #
+IST = pytz.timezone("Asia/Kolkata")
 
+def now_ist():
+    return datetime.now(IST).strftime("%I:%M:%S %p %d-%m-%Y")
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def send_message(chat_id, text):
-    url = f"{TELEGRAM_API}/sendMessage"
+def fetch_status(url: str) -> str:
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text})
+        if ".in" in url:
+            return "❌ Skipped (.in not supported)"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        if ".store" in url:
+            button = soup.select_one("button.add-to-cart")
+            if not button:
+                return "❌ Page structure changed"
+            return "✅ In Stock" if button.text.strip().lower() == "add to cart" else "❌ Out of Stock"
+
+        return "❌ Unknown domain"
     except Exception as e:
-        print(f"⚠️ Error sending message: {e}")
+        logging.error(f"Error fetching {url}: {e}")
+        return f"❌ Error: {e}"
 
-
-def get_status(url):
-    """Fetch stock status from hmtwatches.store"""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return "error"
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Example: look for "Add to Cart" button or "Out of Stock" text
-        if soup.find(string=lambda t: "Out of stock" in t or "OUT OF STOCK" in t):
-            return "out"
-        elif soup.find(string=lambda t: "Add to cart" in t or "BUY NOW" in t):
-            return "in"
-        else:
-            return "unknown"
-    except Exception as e:
-        print(f"⚠️ Error fetching {url}: {e}")
-        return "error"
-
-
-def format_time(dt):
-    """Convert UTC datetime to IST in 12-hour format"""
-    ist = pytz.timezone("Asia/Kolkata")
-    local_time = dt.astimezone(ist)
-    return local_time.strftime("%I:%M %p %d-%b-%Y")
-
-
-# -----------------------------
-# Bot Logic
-# -----------------------------
-def handle_update(update):
-    if "message" not in update:
-        return
-
-    msg = update["message"]
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "").strip()
-
+def get_user(chat_id):
     user = users_col.find_one({"chat_id": chat_id})
     if not user:
-        user = {"chat_id": chat_id, "watches": [], "interval": 5}
+        user = {
+            "chat_id": chat_id,
+            "links": [],
+            "interval": 5,
+            "notify": True,
+            "last_checked": None
+        }
         users_col.insert_one(user)
+    return user
 
-    if text == "/start":
-        send_message(chat_id, "👋 Welcome to HMT Tracker Bot!\nSend me a product link from hmtwatches.store to track stock.")
+def update_user(chat_id, data):
+    users_col.update_one({"chat_id": chat_id}, {"$set": data})
 
-    elif text.startswith("http"):
-        if ".store" not in text:
-            send_message(chat_id, "❌ Only links from hmtwatches.store are supported.")
-            return
-        watches = user.get("watches", [])
-        watches.append({"url": text, "last_status": "unknown"})
-        users_col.update_one({"chat_id": chat_id}, {"$set": {"watches": watches}})
-        send_message(chat_id, f"✅ Added watch to tracking:\n{text}")
+# ---------------- COMMANDS ---------------- #
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 Welcome to HMT Stock Bot!\n\n"
+        "Commands:\n"
+        "/add <link>\n"
+        "/list\n"
+        "/remove <index>\n"
+        "/update <index> <new_link>\n"
+        "/interval <minutes>\n"
+        "/notify on|off\n"
+        "/stats"
+    )
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
 
-    elif text == "/status":
-        watches = user.get("watches", [])
-        if not watches:
-            send_message(chat_id, "📭 You are not tracking any watches.")
-        else:
-            lines = []
-            for w in watches:
-                lines.append(f"🔗 {w['url']}\nStatus: {w['last_status']}")
-            now = datetime.utcnow()
-            lines.append(f"\n⏱ Last checked: {format_time(now)}")
-            send_message(chat_id, "\n\n".join(lines))
+async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    if not context.args:
+        return await update.message.reply_text("❌ Usage: /add <product_link>")
+    url = context.args[0]
+    if ".in" in url:
+        return await update.message.reply_text("❌ .in links are not supported. Use .store")
+    user["links"].append(url)
+    update_user(chat_id, {"links": user["links"]})
+    await update.message.reply_text(f"✅ Added: {url}")
 
+async def list_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    if not user["links"]:
+        return await update.message.reply_text("No links added yet.")
+    text = "\n".join([f"{i+1}. {l}" for i, l in enumerate(user["links"])])
+    await update.message.reply_text("🔗 Tracked Links:\n" + text)
+
+async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("❌ Usage: /remove <index>")
+    idx = int(context.args[0]) - 1
+    if 0 <= idx < len(user["links"]):
+        removed = user["links"].pop(idx)
+        update_user(chat_id, {"links": user["links"]})
+        await update.message.reply_text(f"🗑 Removed: {removed}")
     else:
-        send_message(chat_id, "❓ Unknown command. Use /start or send me a product link.")
+        await update.message.reply_text("❌ Invalid index")
 
+async def update_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        return await update.message.reply_text("❌ Usage: /update <index> <new_link>")
+    idx = int(context.args[0]) - 1
+    new_link = context.args[1]
+    if ".in" in new_link:
+        return await update.message.reply_text("❌ .in links are not supported. Use .store")
+    if 0 <= idx < len(user["links"]):
+        user["links"][idx] = new_link
+        update_user(chat_id, {"links": user["links"]})
+        await update.message.reply_text(f"🔄 Updated index {idx+1}")
+    else:
+        await update.message.reply_text("❌ Invalid index")
 
-def poll_updates():
-    print("🤖 Bot polling started...")
-    offset = None
-    while True:
-        try:
-            resp = requests.get(f"{TELEGRAM_API}/getUpdates", params={"timeout": 30, "offset": offset})
-            data = resp.json()
-            if "result" in data:
-                for update in data["result"]:
-                    offset = update["update_id"] + 1
-                    handle_update(update)
-        except Exception as e:
-            print(f"⚠️ Polling error: {e}")
-        time.sleep(1)
+async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args or not context.args[0].isdigit():
+        return await update.message.reply_text("❌ Usage: /interval <minutes>")
+    minutes = int(context.args[0])
+    update_user(chat_id, {"interval": minutes})
+    await update.message.reply_text(f"⏱ Interval set to {minutes} minutes")
 
+async def notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args or context.args[0].lower() not in ["on", "off"]:
+        return await update.message.reply_text("❌ Usage: /notify on|off")
+    state = context.args[0].lower() == "on"
+    update_user(chat_id, {"notify": state})
+    await update.message.reply_text("🔔 Notifications " + ("enabled" if state else "disabled"))
 
-def check_watches():
-    print("🔍 Checking watches...")
-    for user in users_col.find():
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    text = (
+        f"📊 Tracked: {len(user['links'])} watches\n"
+        f"Interval: {user['interval']} min\n"
+        f"Last checked: {user['last_checked'] or 'Never'}"
+    )
+    await update.message.reply_text(text)
+
+# ---------------- BACKGROUND TASK ---------------- #
+async def check_links(app):
+    users = list(users_col.find({}))
+    for user in users:
         chat_id = user["chat_id"]
-        for watch in user.get("watches", []):
-            url = watch["url"]
-            status = get_status(url)
-            if status == "error":
-                send_message(chat_id, f"⚠️ Problem fetching {url}. The product page may have changed.")
-            elif status != watch["last_status"]:
-                if status == "in":
-                    send_message(chat_id, f"✅ In Stock!\n{url}")
-                elif status == "out":
-                    send_message(chat_id, f"❌ Out of Stock!\n{url}")
-                users_col.update_one(
-                    {"chat_id": chat_id, "watches.url": url},
-                    {"$set": {"watches.$.last_status": status}},
-                )
+        results = []
+        for link in user["links"]:
+            status = fetch_status(link)
+            results.append(f"{link} → {status}")
+        last_checked = now_ist()
+        update_user(chat_id, {"last_checked": last_checked})
+        if user["notify"]:
+            text = "📢 Update:\n" + "\n".join(results) + f"\n⏰ {last_checked}"
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text)
+            except Exception as e:
+                logging.error(f"Failed to send message: {e}")
 
+def run_scheduler(app):
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(lambda: app.create_task(check_links(app)), "interval", minutes=5)
+    scheduler.start()
 
-def schedule_checker():
-    while True:
-        check_watches()
-        time.sleep(300)  # every 5 minutes
+# ---------------- MAIN ---------------- #
+def main():
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add", add))
+    application.add_handler(CommandHandler("list", list_links))
+    application.add_handler(CommandHandler("remove", remove))
+    application.add_handler(CommandHandler("update", update_link))
+    application.add_handler(CommandHandler("interval", set_interval))
+    application.add_handler(CommandHandler("notify", notify))
+    application.add_handler(CommandHandler("stats", stats))
 
-# -----------------------------
-# Start Both Bot + Flask
-# -----------------------------
-def run_all():
-    # Start Flask in thread
-    def run_flask():
-        app.run(host="0.0.0.0", port=8080)
+    # Scheduler
+    run_scheduler(application)
 
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    # Start scheduler in thread
-    scheduler_thread = threading.Thread(target=schedule_checker)
-    scheduler_thread.daemon = True
-    scheduler_thread.start()
-
-    # Run bot polling in main thread
-    poll_updates()
-
+    application.run_polling()
 
 if __name__ == "__main__":
-    run_all()
+    main()
