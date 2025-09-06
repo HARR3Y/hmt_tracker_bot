@@ -1,12 +1,12 @@
-# app.py - HMT Stock Bot with MongoDB and self-ping
+# app.py - Telegram Bot with Flask self-ping for Render
 # Bot username: @hmt_tracker_bot
 
 import os
 import requests
 import time
+import threading
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
-import threading
 from flask import Flask
 from pymongo import MongoClient
 from urllib.parse import quote_plus
@@ -27,7 +27,14 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 # ---------- MONGODB ----------
 client = MongoClient(MONGO_URI)
 db = client.hmt_tracker_bot
-users_col = db.users  # Each document: {"_id": chat_id, "watches": [...], "interval": 5, "notify": True, "last_checked": ...}
+users_col = db.users
+
+# ---------- FLASK APP ----------
+app = Flask("keep_alive")  # Must be named `app` for Gunicorn
+
+@app.route("/ping")
+def ping():
+    return "ok", 200
 
 # ---------- TELEGRAM HELPERS ----------
 def send_message(chat_id, text):
@@ -49,7 +56,6 @@ def evaluate_stock(url):
         text = soup.get_text(separator=" ").lower()
         out_markers = ["out of stock", "sold out", "currently unavailable", "unavailable"]
         in_markers = ["add to cart", "add to bag", "buy now", "in stock", "add to basket"]
-
         if any(m in text for m in out_markers):
             return "out"
         if any(m in text for m in in_markers):
@@ -69,12 +75,11 @@ def page_title(url):
         pass
     return url
 
-# ---------- TIME FORMATTING ----------
 def format_ist(dt_utc):
     ist = dt_utc + timedelta(hours=5, minutes=30)
     return ist.strftime("%d-%m-%Y %I:%M:%S %p")
 
-# ---------- CHECK ALL WATCHES ----------
+# ---------- BOT LOGIC ----------
 def check_all_watches():
     now_utc = datetime.now(timezone.utc)
     for user_doc in users_col.find({}):
@@ -87,18 +92,15 @@ def check_all_watches():
             new_status = evaluate_stock(url)
             old_status = w.get("last_status", "unknown")
 
-            # Notify if available
             if new_status == "in" and old_status != "in" and user_doc.get("notify", True):
                 title = page_title(url)
                 msg = f"🚨 {title}\nAVAILABLE!\n{url}\nTracked by {BOT_USERNAME}"
                 send_message(chat_id, msg)
 
-            # Notify if tracking fails
             if new_status == "unknown" and user_doc.get("notify", True):
-                msg = f"⚠️ Could not track the watch!\nCheck: {url}\nPossible site changes or product page issue."
+                msg = f"⚠️ Could not track the watch!\nCheck: {url}\nPossible site changes."
                 send_message(chat_id, msg)
 
-            # Update status and last checked
             w["last_status"] = new_status
             w["last_checked"] = now_utc.isoformat()
 
@@ -107,7 +109,16 @@ def check_all_watches():
             {"$set": {"watches": watches, "last_checked": now_utc.isoformat()}}
         )
 
-# ---------- COMMAND HANDLING ----------
+def get_updates(offset=None):
+    try:
+        url = f"{BASE_TELEGRAM}/getUpdates"
+        params = {"timeout": 30, "offset": offset}
+        r = requests.get(url, params=params, timeout=35)
+        return r.json().get("result", [])
+    except Exception as e:
+        print("get_updates error:", e)
+        return []
+
 def handle_command(chat_id, text):
     chat_id = str(chat_id)
     user_doc = users_col.find_one({"_id": chat_id})
@@ -145,49 +156,6 @@ def handle_command(chat_id, text):
         send_message(chat_id, "📋 Your watches:\n" + "\n".join(lines))
         return
 
-    if cmd == "/remove" and len(parts) > 1:
-        try:
-            idx = int(parts[1]) - 1
-            removed = user_doc["watches"].pop(idx)
-            users_col.update_one({"_id": chat_id}, {"$set": {"watches": user_doc["watches"]}})
-            send_message(chat_id, f"🗑️ Removed: {removed['url']}")
-        except:
-            send_message(chat_id, "❌ Invalid index.")
-        return
-
-    if cmd == "/update" and len(parts) > 2:
-        try:
-            idx = int(parts[1]) - 1
-            new_link = parts[2].strip()
-            user_doc["watches"][idx]["url"] = new_link
-            user_doc["watches"][idx]["last_status"] = "unknown"
-            user_doc["watches"][idx]["last_checked"] = None
-            users_col.update_one({"_id": chat_id}, {"$set": {"watches": user_doc["watches"]}})
-            send_message(chat_id, f"🔄 Updated #{idx+1} -> {new_link}")
-        except:
-            send_message(chat_id, "❌ Invalid index or error.")
-        return
-
-    if cmd == "/interval" and len(parts) > 1:
-        try:
-            m = int(parts[1])
-            user_doc["interval"] = max(1, m)
-            users_col.update_one({"_id": chat_id}, {"$set": {"interval": user_doc["interval"]}})
-            send_message(chat_id, f"⏱ Interval set to {user_doc['interval']} minutes.")
-        except:
-            send_message(chat_id, "❌ Invalid number.")
-        return
-
-    if cmd == "/notify" and len(parts) > 1:
-        arg = parts[1].lower()
-        if arg in ("on", "true", "1"):
-            user_doc["notify"] = True
-        elif arg in ("off", "false", "0"):
-            user_doc["notify"] = False
-        users_col.update_one({"_id": chat_id}, {"$set": {"notify": user_doc["notify"]}})
-        send_message(chat_id, f"🔔 Notifications {'ON' if user_doc['notify'] else 'OFF'}")
-        return
-
     if cmd == "/stats":
         wcount = len(user_doc.get("watches", []))
         last_checked = user_doc.get("last_checked")
@@ -198,34 +166,8 @@ def handle_command(chat_id, text):
         send_message(chat_id, f"📊 Tracked: {wcount} watches\nInterval: {user_doc.get('interval',5)} min\nLast checked: {last_checked}")
         return
 
-    send_message(chat_id, "❓ Unknown command. Send /help")
-
-# ---------- TELEGRAM LONG POLLING ----------
-def get_updates(offset=None):
-    try:
-        url = f"{BASE_TELEGRAM}/getUpdates"
-        params = {"timeout": 30, "offset": offset}
-        r = requests.get(url, params=params, timeout=35)
-        return r.json().get("result", [])
-    except Exception as e:
-        print("get_updates error:", e)
-        return []
-
-# ---------- KEEP-ALIVE ENDPOINT ----------
-keep_alive_app = Flask("keep_alive")
-
-@keep_alive_app.route("/ping")
-def ping():
-    return "ok", 200
-
-def run_keep_alive():
-    keep_alive_app.run(host="0.0.0.0", port=8080)
-
-threading.Thread(target=run_keep_alive, daemon=True).start()
-
-# ---------- MAIN LOOP ----------
-if __name__ == "__main__":
-    print(f"🤖 Bot {BOT_USERNAME} started (long polling mode)...")
+# ---------- BACKGROUND THREAD ----------
+def bot_loop():
     offset = None
     while True:
         updates = get_updates(offset)
@@ -234,14 +176,11 @@ if __name__ == "__main__":
             msg = u.get("message") or u.get("edited_message")
             if msg and "text" in msg:
                 handle_command(msg["chat"]["id"], msg["text"])
-
-        # Check all watches
         check_all_watches()
-
-        # Self-ping to keep alive every 5 min (for Replit/Render)
-        try:
-            requests.get(f"http://{os.environ.get('REPL_SLUG', 'yourapp')}.repl.co/ping", timeout=5)
-        except:
-            pass
-
         time.sleep(5)
+
+threading.Thread(target=bot_loop, daemon=True).start()
+
+# ---------- RUN FLASK ----------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
