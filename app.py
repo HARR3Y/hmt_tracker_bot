@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-PORT = int(os.environ.get("PORT", 8443))
+
+# Use the PORT provided by Render's environment.
+# If it's not set, this will raise an error, which is desired as it's a required variable.
+PORT = int(os.environ.get("PORT"))
 
 if not BOT_TOKEN or not WEBHOOK_URL:
     raise RuntimeError("Missing BOT_TOKEN or WEBHOOK_URL environment variable")
