@@ -3,4 +3,7 @@ requests
 beautifulsoup4
 pymongo
 dnspython
+python-telegram-bot==20.3
+apscheduler
+gunicorn
 pytz
