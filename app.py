@@ -1,9 +1,9 @@
-# app.py - HMT Stock Bot with MongoDB persistence
+# app.py - HMT Stock Bot with MongoDB + Render keep-alive
 # Bot username: @hmt_tracker_bot
 
 import os
-import time
 import requests
+import time
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from flask import Flask
@@ -12,34 +12,31 @@ from pymongo import MongoClient
 
 # ---------- config ----------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+MONGO_URI = os.environ.get("MONGO_URI")
+BOT_USERNAME = "@hmt_tracker_bot"
+
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Set TELEGRAM_TOKEN environment variable")
+    raise RuntimeError("Missing TELEGRAM_TOKEN")
+if not MONGO_URI:
+    raise RuntimeError("Missing MONGO_URI")
 
 BASE_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-BOT_USERNAME = "@hmt_tracker_bot"
 
-MONGO_URI = os.environ.get("MONGO_URI")
-MONGO_DB = os.environ.get("MONGO_DB", "hmtbot")
-
+# ---------- MongoDB setup ----------
 client = MongoClient(MONGO_URI)
-db = client[MONGO_DB]
-users_col = db["users"]
-state_col = db["state"]  # stores last update_id
+db = client["hmt_bot"]
+users_collection = db["users"]
+state_collection = db["state"]  # for last_update_id
 
-
-# ---------- telegram helpers ----------
+# ---------- helpers ----------
 def send_message(chat_id, text):
     url = f"{BASE_TELEGRAM}/sendMessage"
     try:
-        resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=10)
-        return resp.ok
+        requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=10)
     except Exception as e:
         print("send_message error:", e)
-        return False
 
-
-# ---------- stock detection ----------
 def evaluate_stock(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
@@ -47,18 +44,14 @@ def evaluate_stock(url):
             return "unknown"
         soup = BeautifulSoup(r.text, "html.parser")
         text = soup.get_text(separator=" ").lower()
-        out_markers = ["out of stock", "sold out", "currently unavailable", "unavailable"]
-        in_markers = ["add to cart", "add to bag", "buy now", "in stock", "add to basket"]
-
-        if any(m in text for m in out_markers):
+        if any(m in text for m in ["out of stock", "sold out", "currently unavailable", "unavailable"]):
             return "out"
-        if any(m in text for m in in_markers):
+        if any(m in text for m in ["add to cart", "add to bag", "buy now", "in stock", "add to basket"]):
             return "in"
         return "unknown"
     except Exception as e:
         print("evaluate error for", url, e)
         return "unknown"
-
 
 def page_title(url):
     try:
@@ -70,18 +63,14 @@ def page_title(url):
         pass
     return url
 
-
-# ---------- core check logic ----------
+# ---------- core check ----------
 def check_all_watches():
     now_iso = datetime.now(timezone.utc).isoformat()
-    changed = False
-
-    for user in users_col.find():
-        chat_id = str(user["_id"])
-        interval = int(user.get("interval", 5))
-        last_checked = user.get("last_checked")
+    users = users_collection.find({})
+    for u in users:
+        interval = u.get("interval", 5)
+        last_checked = u.get("last_checked")
         should_check = False
-
         if not last_checked:
             should_check = True
         else:
@@ -96,44 +85,35 @@ def check_all_watches():
         if not should_check:
             continue
 
-        watches = user.get("watches", [])
-        for w in watches:
+        updated_watches = []
+        for w in u.get("watches", []):
             url = w.get("url")
             if not url:
                 continue
             new_status = evaluate_stock(url)
             old_status = w.get("last_status", "unknown")
 
-            if new_status == "in" and old_status != "in" and user.get("notify", True):
+            if new_status == "in" and old_status != "in" and u.get("notify", True):
                 title = page_title(url)
                 msg = f"🚨 {title}\nAVAILABLE!\n{url}\nTracked by {BOT_USERNAME}"
-                send_message(chat_id, msg)
+                send_message(u["_id"], msg)
 
             w["last_status"] = new_status
             w["last_checked"] = now_iso
+            updated_watches.append(w)
 
-        users_col.update_one({"_id": chat_id}, {"$set": {
-            "watches": watches,
-            "last_checked": now_iso
-        }})
-        changed = True
+        users_collection.update_one(
+            {"_id": u["_id"]},
+            {"$set": {"watches": updated_watches, "last_checked": now_iso}}
+        )
 
-    return changed
-
-
-# ---------- command handling ----------
+# ---------- commands ----------
 def handle_command(chat_id, text):
     chat_id = str(chat_id)
-    user = users_col.find_one({"_id": chat_id})
+    user = users_collection.find_one({"_id": chat_id})
     if not user:
-        user = {
-            "_id": chat_id,
-            "watches": [],
-            "interval": 5,
-            "notify": True,
-            "last_checked": None
-        }
-        users_col.insert_one(user)
+        user = {"_id": chat_id, "watches": [], "interval": 5, "notify": True, "last_checked": None}
+        users_collection.insert_one(user)
 
     parts = text.strip().split(maxsplit=2)
     cmd = parts[0].lower()
@@ -148,7 +128,7 @@ def handle_command(chat_id, text):
             return
         url = parts[1].strip()
         user["watches"].append({"url": url, "last_status": "unknown", "last_checked": None})
-        users_col.update_one({"_id": chat_id}, {"$set": {"watches": user["watches"]}})
+        users_collection.update_one({"_id": chat_id}, {"$set": user})
         send_message(chat_id, f"✅ Added: {url}")
         return
 
@@ -157,7 +137,7 @@ def handle_command(chat_id, text):
         if not watches:
             send_message(chat_id, "📭 No watches tracked.")
             return
-        lines = [f"{i}. {w['url']} — status: {w.get('last_status','unknown')}" for i, w in enumerate(watches, 1)]
+        lines = [f"{i}. {w['url']} — {w.get('last_status','unknown')}" for i, w in enumerate(watches, 1)]
         send_message(chat_id, "📋 Your watches:\n" + "\n".join(lines))
         return
 
@@ -168,9 +148,9 @@ def handle_command(chat_id, text):
         try:
             idx = int(parts[1]) - 1
             removed = user["watches"].pop(idx)
-            users_col.update_one({"_id": chat_id}, {"$set": {"watches": user["watches"]}})
+            users_collection.update_one({"_id": chat_id}, {"$set": user})
             send_message(chat_id, f"🗑️ Removed: {removed['url']}")
-        except Exception:
+        except:
             send_message(chat_id, "❌ Invalid index.")
         return
 
@@ -184,9 +164,9 @@ def handle_command(chat_id, text):
             user["watches"][idx]["url"] = new_link
             user["watches"][idx]["last_status"] = "unknown"
             user["watches"][idx]["last_checked"] = None
-            users_col.update_one({"_id": chat_id}, {"$set": {"watches": user["watches"]}})
+            users_collection.update_one({"_id": chat_id}, {"$set": user})
             send_message(chat_id, f"🔄 Updated #{idx+1} -> {new_link}")
-        except Exception:
+        except:
             send_message(chat_id, "❌ Invalid index or error.")
         return
 
@@ -197,7 +177,7 @@ def handle_command(chat_id, text):
         try:
             m = int(parts[1])
             user["interval"] = max(1, m)
-            users_col.update_one({"_id": chat_id}, {"$set": {"interval": user["interval"]}})
+            users_collection.update_one({"_id": chat_id}, {"$set": user})
             send_message(chat_id, f"⏱ Interval set to {user['interval']} minutes.")
         except:
             send_message(chat_id, "❌ Invalid number.")
@@ -210,14 +190,13 @@ def handle_command(chat_id, text):
         arg = parts[1].lower()
         if arg in ("on", "true", "1"):
             user["notify"] = True
-            users_col.update_one({"_id": chat_id}, {"$set": {"notify": True}})
             send_message(chat_id, "🔔 Notifications ON")
         elif arg in ("off", "false", "0"):
             user["notify"] = False
-            users_col.update_one({"_id": chat_id}, {"$set": {"notify": False}})
             send_message(chat_id, "🔕 Notifications OFF")
         else:
             send_message(chat_id, "Usage: /notify on|off")
+        users_collection.update_one({"_id": chat_id}, {"$set": user})
         return
 
     if cmd == "/stats":
@@ -226,7 +205,6 @@ def handle_command(chat_id, text):
         return
 
     send_message(chat_id, "❓ Unknown command. Send /help")
-
 
 # ---------- Telegram polling ----------
 def get_updates(offset=None):
@@ -239,8 +217,7 @@ def get_updates(offset=None):
         print("get_updates error:", e)
         return []
 
-
-# ---------- keep-alive endpoint ----------
+# ---------- keep-alive ----------
 keep_alive_app = Flask("keep_alive")
 
 @keep_alive_app.route("/ping")
@@ -248,42 +225,28 @@ def ping():
     return "ok", 200
 
 def run_keep_alive():
-    keep_alive_app.run(host="0.0.0.0", port=8080)
-
+    port = int(os.environ.get("PORT", 8080))
+    keep_alive_app.run(host="0.0.0.0", port=port)
 
 threading.Thread(target=run_keep_alive, daemon=True).start()
 
-
 # ---------- main loop ----------
 if __name__ == "__main__":
-    print(f"🤖 Bot {BOT_USERNAME} started with MongoDB persistence...")
-
-    state = state_col.find_one({"_id": "global"}) or {"_id": "global", "last_update_id": 0}
-    offset = state.get("last_update_id", 0)
-
+    print(f"🤖 Bot {BOT_USERNAME} started...")
+    offset = 0
     while True:
-        # Poll Telegram messages
         updates = get_updates(offset + 1)
         for u in updates:
             offset = u["update_id"]
-            state_col.update_one({"_id": "global"}, {"$set": {"last_update_id": offset}}, upsert=True)
-
             msg = u.get("message") or u.get("edited_message")
             if msg and "text" in msg:
                 chat_id = msg["chat"]["id"]
                 text = msg["text"]
-                try:
-                    handle_command(chat_id, text)
-                except Exception as e:
-                    print("handle_command error:", e)
+                handle_command(chat_id, text)
 
-        # Check stock
         check_all_watches()
-
-        # Self-ping every 5 minutes
         try:
-            requests.get("https://kushagraonly.onrender.com/ping", timeout=5)
+            requests.get(f"https://{os.environ.get('RENDER_EXTERNAL_URL')}/ping", timeout=5)
         except:
             pass
-
         time.sleep(5)
