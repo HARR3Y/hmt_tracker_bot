@@ -21,8 +21,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Load environment variables
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+BOT_TOKEN = os.environ.get("8343686028:AAHWD1psflTNUxoUG7E9NeR1HxbUlCg_DbE")
+WEBHOOK_URL = os.environ.get("https://hmt-tracker-bot.onrender.com/")
 PORT = int(os.environ.get("PORT", 8443))
 
 if not BOT_TOKEN or not WEBHOOK_URL:
