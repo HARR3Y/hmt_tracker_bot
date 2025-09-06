@@ -1,21 +1,4 @@
-# Telegram Bot
-python-telegram-bot
-
-# Scheduler for periodic stock checks
-apscheduler
-
-# HTTP requests & HTML parsing
-requests
-beautifulsoup4
-
-# MongoDB
-pymongo[srv]
-dnspython
-
-# Flask for keep-alive endpoint
-Flask
-
-# Gunicorn for Render deployment
-gunicorn
-
-pytz
+python-telegram-bot>=20.6
+Flask>=2.3
+httpx>=0.25
+apscheduler>=3.10
