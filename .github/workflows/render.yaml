@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hmt-tracker-bot
+    env: python
+    region: oregon   # you can change region if needed
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGO_URI
+        sync: false
