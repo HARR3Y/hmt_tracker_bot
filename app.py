@@ -1,186 +1,95 @@
-# app.py - Telegram Bot with Flask self-ping for Render
-# Bot username: @hmt_tracker_bot
-
 import os
 import requests
-import time
-import threading
-from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from flask import Flask
+from threading import Thread
 from pymongo import MongoClient
-from urllib.parse import quote_plus
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
+import pytz
 
-# ---------- CONFIG ----------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-MONGO_URI = os.environ.get("MONGO_URI")
-BOT_USERNAME = "@hmt_tracker_bot"
+# ================== CONFIG ==================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+MONGO_URI = os.getenv("MONGO_URI")
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN")
-if not MONGO_URI:
-    raise RuntimeError("Missing MONGO_URI")
-
-BASE_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-# ---------- MONGODB ----------
+# DB setup
 client = MongoClient(MONGO_URI)
-db = client.hmt_tracker_bot
-users_col = db.users
+db = client["watch_tracker"]
+collection = db["watches"]
 
-# ---------- FLASK APP ----------
-app = Flask("keep_alive")  # Must be named `app` for Gunicorn
+# Flask keep-alive
+app = Flask(__name__)
 
-@app.route("/ping")
-def ping():
-    return "ok", 200
+@app.route("/")
+def home():
+    return "Bot is alive ✅"
 
-# ---------- TELEGRAM HELPERS ----------
-def send_message(chat_id, text):
-    url = f"{BASE_TELEGRAM}/sendMessage"
+# Telegram notify
+def send_message(text: str):
     try:
-        resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=10)
-        return resp.ok
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text})
     except Exception as e:
-        print("send_message error:", e)
-        return False
+        print(f"Error sending message: {e}")
 
-# ---------- STOCK CHECK ----------
-def evaluate_stock(url):
+# Convert UTC to India 12-hour format
+def format_indian_time():
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    return now.strftime("%I:%M %p %d-%b-%Y")
+
+# Extract stock info from hmtwatches.store (stable UUID links)
+def check_store_site(url: str):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        if r.status_code != 200:
-            return "unknown"
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(separator=" ").lower()
-        out_markers = ["out of stock", "sold out", "currently unavailable", "unavailable"]
-        in_markers = ["add to cart", "add to bag", "buy now", "in stock", "add to basket"]
-        if any(m in text for m in out_markers):
-            return "out"
-        if any(m in text for m in in_markers):
-            return "in"
-        return "unknown"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        title = soup.find("h1").get_text(strip=True)
+        stock_btn = soup.find("button", {"type": "submit"})
+
+        in_stock = stock_btn is not None and "Add to Cart" in stock_btn.get_text()
+        return {"title": title, "in_stock": in_stock}
     except Exception as e:
-        print("evaluate error for", url, e)
-        return "unknown"
+        send_message(f"⚠️ Error checking product:\n{url}\nError: {e}")
+        return None
 
-def page_title(url):
+# Main tracker
+def tracker():
+    watches = list(collection.find())
+    for w in watches:
+        result = check_store_site(w["url"])
+        if result:
+            status = "✅ In Stock" if result["in_stock"] else "❌ Out of Stock"
+            send_message(
+                f"⌚ {result['title']}\n"
+                f"🔗 {w['url']}\n"
+                f"📦 Status: {status}\n"
+                f"🕒 Last checked: {format_indian_time()}"
+            )
+
+# Self-ping (to prevent Render sleep)
+def self_ping():
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        if soup.title and soup.title.string:
-            return soup.title.string.strip()
+        requests.get("https://your-app-name.onrender.com")
     except:
         pass
-    return url
 
-def format_ist(dt_utc):
-    ist = dt_utc + timedelta(hours=5, minutes=30)
-    return ist.strftime("%d-%m-%Y %I:%M:%S %p")
+# Scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(tracker, "interval", minutes=5)   # check every 5 min
+scheduler.add_job(self_ping, "interval", minutes=10)  # ping every 10 min
+scheduler.start()
 
-# ---------- BOT LOGIC ----------
-def check_all_watches():
-    now_utc = datetime.now(timezone.utc)
-    for user_doc in users_col.find({}):
-        chat_id = str(user_doc["_id"])
-        watches = user_doc.get("watches", [])
-        for w in watches:
-            url = w.get("url")
-            if not url:
-                continue
-            new_status = evaluate_stock(url)
-            old_status = w.get("last_status", "unknown")
+# Run Flask in background
+def run():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
-            if new_status == "in" and old_status != "in" and user_doc.get("notify", True):
-                title = page_title(url)
-                msg = f"🚨 {title}\nAVAILABLE!\n{url}\nTracked by {BOT_USERNAME}"
-                send_message(chat_id, msg)
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
-            if new_status == "unknown" and user_doc.get("notify", True):
-                msg = f"⚠️ Could not track the watch!\nCheck: {url}\nPossible site changes."
-                send_message(chat_id, msg)
-
-            w["last_status"] = new_status
-            w["last_checked"] = now_utc.isoformat()
-
-        users_col.update_one(
-            {"_id": user_doc["_id"]},
-            {"$set": {"watches": watches, "last_checked": now_utc.isoformat()}}
-        )
-
-def get_updates(offset=None):
-    try:
-        url = f"{BASE_TELEGRAM}/getUpdates"
-        params = {"timeout": 30, "offset": offset}
-        r = requests.get(url, params=params, timeout=35)
-        return r.json().get("result", [])
-    except Exception as e:
-        print("get_updates error:", e)
-        return []
-
-def handle_command(chat_id, text):
-    chat_id = str(chat_id)
-    user_doc = users_col.find_one({"_id": chat_id})
-    if not user_doc:
-        user_doc = {"_id": chat_id, "watches": [], "interval": 5, "notify": True, "last_checked": None}
-        users_col.insert_one(user_doc)
-
-    parts = text.strip().split(maxsplit=2)
-    cmd = parts[0].lower()
-
-    if cmd in ("/start", "/help"):
-        send_message(chat_id, f"👋 Welcome to HMT Stock Bot {BOT_USERNAME}!\nCommands:\n/add <link>\n/list\n/remove <index>\n/update <index> <new_link>\n/interval <minutes>\n/notify on|off\n/stats")
-        return
-
-    if cmd == "/add" and len(parts) > 1:
-        url = parts[1].strip()
-        user_doc["watches"].append({"url": url, "last_status": "unknown", "last_checked": None})
-        users_col.update_one({"_id": chat_id}, {"$set": {"watches": user_doc["watches"]}})
-        send_message(chat_id, f"✅ Added: {url}")
-        return
-
-    if cmd == "/list":
-        watches = user_doc.get("watches", [])
-        if not watches:
-            send_message(chat_id, "📭 No watches tracked.")
-            return
-        lines = []
-        for i, w in enumerate(watches, 1):
-            lc = w.get("last_checked")
-            if lc:
-                lc = format_ist(datetime.fromisoformat(lc))
-            else:
-                lc = "Never"
-            lines.append(f"{i}. {w['url']} — status: {w.get('last_status','unknown')} — Last checked: {lc}")
-        send_message(chat_id, "📋 Your watches:\n" + "\n".join(lines))
-        return
-
-    if cmd == "/stats":
-        wcount = len(user_doc.get("watches", []))
-        last_checked = user_doc.get("last_checked")
-        if last_checked:
-            last_checked = format_ist(datetime.fromisoformat(last_checked))
-        else:
-            last_checked = "Never"
-        send_message(chat_id, f"📊 Tracked: {wcount} watches\nInterval: {user_doc.get('interval',5)} min\nLast checked: {last_checked}")
-        return
-
-# ---------- BACKGROUND THREAD ----------
-def bot_loop():
-    offset = None
-    while True:
-        updates = get_updates(offset)
-        for u in updates:
-            offset = u["update_id"] + 1
-            msg = u.get("message") or u.get("edited_message")
-            if msg and "text" in msg:
-                handle_command(msg["chat"]["id"], msg["text"])
-        check_all_watches()
-        time.sleep(5)
-
-threading.Thread(target=bot_loop, daemon=True).start()
-
-# ---------- RUN FLASK ----------
+# Entry point
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    keep_alive()
