@@ -1,4 +1,7 @@
-python-telegram-bot>=20.6
+
 Flask>=2.3
 httpx>=0.25
 apscheduler>=3.10
+
+
+python-telegram-bot[webhooks]
