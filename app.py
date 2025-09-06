@@ -1,20 +1,20 @@
-# app.py - HMT Stock Bot with MongoDB + IST 12-hour stats
+# app.py - HMT Stock Bot with MongoDB and self-ping
 # Bot username: @hmt_tracker_bot
 
 import os
-import json
 import requests
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 import threading
 from flask import Flask
 from pymongo import MongoClient
 from urllib.parse import quote_plus
 
-# ---------- config ----------
+# ---------- CONFIG ----------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
+BOT_USERNAME = "@hmt_tracker_bot"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN")
@@ -22,14 +22,14 @@ if not MONGO_URI:
     raise RuntimeError("Missing MONGO_URI")
 
 BASE_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-BOT_USERNAME = "@hmt_tracker_bot"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ---------- MongoDB setup ----------
+# ---------- MONGODB ----------
 client = MongoClient(MONGO_URI)
-db = client["hmt_bot"]
-users_col = db["users"]
+db = client.hmt_tracker_bot
+users_col = db.users  # Each document: {"_id": chat_id, "watches": [...], "interval": 5, "notify": True, "last_checked": ...}
 
-# ---------- telegram helpers ----------
+# ---------- TELEGRAM HELPERS ----------
 def send_message(chat_id, text):
     url = f"{BASE_TELEGRAM}/sendMessage"
     try:
@@ -39,9 +39,7 @@ def send_message(chat_id, text):
         print("send_message error:", e)
         return False
 
-# ---------- stock detection ----------
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
+# ---------- STOCK CHECK ----------
 def evaluate_stock(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
@@ -71,30 +69,16 @@ def page_title(url):
         pass
     return url
 
-# ---------- core check logic ----------
+# ---------- TIME FORMATTING ----------
+def format_ist(dt_utc):
+    ist = dt_utc + timedelta(hours=5, minutes=30)
+    return ist.strftime("%d-%m-%Y %I:%M:%S %p")
+
+# ---------- CHECK ALL WATCHES ----------
 def check_all_watches():
     now_utc = datetime.now(timezone.utc)
-    changed = False
     for user_doc in users_col.find({}):
         chat_id = str(user_doc["_id"])
-        interval = int(user_doc.get("interval", 5))
-        last_checked = user_doc.get("last_checked")
-        should_check = False
-
-        if not last_checked:
-            should_check = True
-        else:
-            try:
-                last_dt = datetime.fromisoformat(last_checked)
-                elapsed = (now_utc - last_dt).total_seconds()
-                if elapsed >= interval * 60:
-                    should_check = True
-            except Exception:
-                should_check = True
-
-        if not should_check:
-            continue
-
         watches = user_doc.get("watches", [])
         for w in watches:
             url = w.get("url")
@@ -103,180 +87,161 @@ def check_all_watches():
             new_status = evaluate_stock(url)
             old_status = w.get("last_status", "unknown")
 
+            # Notify if available
             if new_status == "in" and old_status != "in" and user_doc.get("notify", True):
                 title = page_title(url)
                 msg = f"🚨 {title}\nAVAILABLE!\n{url}\nTracked by {BOT_USERNAME}"
                 send_message(chat_id, msg)
 
+            # Notify if tracking fails
+            if new_status == "unknown" and user_doc.get("notify", True):
+                msg = f"⚠️ Could not track the watch!\nCheck: {url}\nPossible site changes or product page issue."
+                send_message(chat_id, msg)
+
+            # Update status and last checked
             w["last_status"] = new_status
             w["last_checked"] = now_utc.isoformat()
 
-        users_col.update_one({"_id": user_doc["_id"]},
-                             {"$set": {"watches": watches, "last_checked": now_utc.isoformat()}})
-        changed = True
-    return changed
+        users_col.update_one(
+            {"_id": user_doc["_id"]},
+            {"$set": {"watches": watches, "last_checked": now_utc.isoformat()}}
+        )
 
-# ---------- command handling ----------
+# ---------- COMMAND HANDLING ----------
 def handle_command(chat_id, text):
     chat_id = str(chat_id)
     user_doc = users_col.find_one({"_id": chat_id})
     if not user_doc:
-        user_doc = {
-            "_id": chat_id,
-            "watches": [],
-            "interval": 5,
-            "notify": True,
-            "last_checked": None
-        }
+        user_doc = {"_id": chat_id, "watches": [], "interval": 5, "notify": True, "last_checked": None}
         users_col.insert_one(user_doc)
 
     parts = text.strip().split(maxsplit=2)
     cmd = parts[0].lower()
 
-    # --- help/start ---
     if cmd in ("/start", "/help"):
         send_message(chat_id, f"👋 Welcome to HMT Stock Bot {BOT_USERNAME}!\nCommands:\n/add <link>\n/list\n/remove <index>\n/update <index> <new_link>\n/interval <minutes>\n/notify on|off\n/stats")
         return
 
-    # --- add ---
-    if cmd == "/add":
-        if len(parts) < 2:
-            send_message(chat_id, "Usage: /add <product_link>")
-            return
+    if cmd == "/add" and len(parts) > 1:
         url = parts[1].strip()
-        users_col.update_one({"_id": chat_id},
-                             {"$push": {"watches": {"url": url, "last_status": "unknown", "last_checked": None}}})
+        user_doc["watches"].append({"url": url, "last_status": "unknown", "last_checked": None})
+        users_col.update_one({"_id": chat_id}, {"$set": {"watches": user_doc["watches"]}})
         send_message(chat_id, f"✅ Added: {url}")
         return
 
-    # --- list ---
     if cmd == "/list":
         watches = user_doc.get("watches", [])
         if not watches:
             send_message(chat_id, "📭 No watches tracked.")
             return
-        lines = [f"{i}. {w['url']} — status: {w.get('last_status','unknown')}" for i, w in enumerate(watches, 1)]
+        lines = []
+        for i, w in enumerate(watches, 1):
+            lc = w.get("last_checked")
+            if lc:
+                lc = format_ist(datetime.fromisoformat(lc))
+            else:
+                lc = "Never"
+            lines.append(f"{i}. {w['url']} — status: {w.get('last_status','unknown')} — Last checked: {lc}")
         send_message(chat_id, "📋 Your watches:\n" + "\n".join(lines))
         return
 
-    # --- remove ---
-    if cmd == "/remove":
-        if len(parts) < 2:
-            send_message(chat_id, "Usage: /remove <index>")
-            return
+    if cmd == "/remove" and len(parts) > 1:
         try:
             idx = int(parts[1]) - 1
-            watches = user_doc.get("watches", [])
-            removed = watches.pop(idx)
-            users_col.update_one({"_id": chat_id}, {"$set": {"watches": watches}})
+            removed = user_doc["watches"].pop(idx)
+            users_col.update_one({"_id": chat_id}, {"$set": {"watches": user_doc["watches"]}})
             send_message(chat_id, f"🗑️ Removed: {removed['url']}")
         except:
             send_message(chat_id, "❌ Invalid index.")
         return
 
-    # --- update ---
-    if cmd == "/update":
-        if len(parts) < 3:
-            send_message(chat_id, "Usage: /update <index> <new_link>")
-            return
+    if cmd == "/update" and len(parts) > 2:
         try:
             idx = int(parts[1]) - 1
             new_link = parts[2].strip()
-            watches = user_doc.get("watches", [])
-            watches[idx]["url"] = new_link
-            watches[idx]["last_status"] = "unknown"
-            watches[idx]["last_checked"] = None
-            users_col.update_one({"_id": chat_id}, {"$set": {"watches": watches}})
+            user_doc["watches"][idx]["url"] = new_link
+            user_doc["watches"][idx]["last_status"] = "unknown"
+            user_doc["watches"][idx]["last_checked"] = None
+            users_col.update_one({"_id": chat_id}, {"$set": {"watches": user_doc["watches"]}})
             send_message(chat_id, f"🔄 Updated #{idx+1} -> {new_link}")
         except:
             send_message(chat_id, "❌ Invalid index or error.")
         return
 
-    # --- interval ---
-    if cmd == "/interval":
-        if len(parts) < 2:
-            send_message(chat_id, "Usage: /interval <minutes>")
-            return
+    if cmd == "/interval" and len(parts) > 1:
         try:
             m = int(parts[1])
-            users_col.update_one({"_id": chat_id}, {"$set": {"interval": max(1, m)}})
-            send_message(chat_id, f"⏱ Interval set to {max(1,m)} minutes.")
+            user_doc["interval"] = max(1, m)
+            users_col.update_one({"_id": chat_id}, {"$set": {"interval": user_doc["interval"]}})
+            send_message(chat_id, f"⏱ Interval set to {user_doc['interval']} minutes.")
         except:
             send_message(chat_id, "❌ Invalid number.")
         return
 
-    # --- notify ---
-    if cmd == "/notify":
-        if len(parts) < 2:
-            send_message(chat_id, "Usage: /notify on|off")
-            return
+    if cmd == "/notify" and len(parts) > 1:
         arg = parts[1].lower()
         if arg in ("on", "true", "1"):
-            users_col.update_one({"_id": chat_id}, {"$set": {"notify": True}})
-            send_message(chat_id, "🔔 Notifications ON")
+            user_doc["notify"] = True
         elif arg in ("off", "false", "0"):
-            users_col.update_one({"_id": chat_id}, {"$set": {"notify": False}})
-            send_message(chat_id, "🔕 Notifications OFF")
-        else:
-            send_message(chat_id, "Usage: /notify on|off")
+            user_doc["notify"] = False
+        users_col.update_one({"_id": chat_id}, {"$set": {"notify": user_doc["notify"]}})
+        send_message(chat_id, f"🔔 Notifications {'ON' if user_doc['notify'] else 'OFF'}")
         return
 
-    # --- stats ---
     if cmd == "/stats":
-        watches = user_doc.get("watches", [])
-        wcount = len(watches)
-        last_checked_iso = user_doc.get("last_checked")
-        if last_checked_iso:
-            try:
-                dt = datetime.fromisoformat(last_checked_iso)
-                ist_dt = dt + timedelta(hours=5, minutes=30)
-                last_checked_str = ist_dt.strftime("%d-%m-%Y %I:%M:%S %p")
-            except:
-                last_checked_str = last_checked_iso
+        wcount = len(user_doc.get("watches", []))
+        last_checked = user_doc.get("last_checked")
+        if last_checked:
+            last_checked = format_ist(datetime.fromisoformat(last_checked))
         else:
-            last_checked_str = "Never"
-
-        send_message(chat_id, f"📊 Tracked: {wcount} watches\nInterval: {user_doc.get('interval',5)} min\nLast checked: {last_checked_str}")
+            last_checked = "Never"
+        send_message(chat_id, f"📊 Tracked: {wcount} watches\nInterval: {user_doc.get('interval',5)} min\nLast checked: {last_checked}")
         return
 
     send_message(chat_id, "❓ Unknown command. Send /help")
 
-# ---------- Telegram polling ----------
+# ---------- TELEGRAM LONG POLLING ----------
 def get_updates(offset=None):
-    url = f"{BASE_TELEGRAM}/getUpdates"
-    params = {"timeout": 30, "offset": offset}
     try:
+        url = f"{BASE_TELEGRAM}/getUpdates"
+        params = {"timeout": 30, "offset": offset}
         r = requests.get(url, params=params, timeout=35)
         return r.json().get("result", [])
     except Exception as e:
         print("get_updates error:", e)
         return []
 
-# ---------- Flask keep-alive ----------
-app = Flask("keep_alive")
+# ---------- KEEP-ALIVE ENDPOINT ----------
+keep_alive_app = Flask("keep_alive")
 
-@app.route("/ping")
+@keep_alive_app.route("/ping")
 def ping():
     return "ok", 200
 
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
+def run_keep_alive():
+    keep_alive_app.run(host="0.0.0.0", port=8080)
 
-threading.Thread(target=run_flask, daemon=True).start()
+threading.Thread(target=run_keep_alive, daemon=True).start()
 
-# ---------- main loop ----------
+# ---------- MAIN LOOP ----------
 if __name__ == "__main__":
     print(f"🤖 Bot {BOT_USERNAME} started (long polling mode)...")
+    offset = None
     while True:
-        # poll Telegram
-        for u in get_updates():
-            offset = u["update_id"]
+        updates = get_updates(offset)
+        for u in updates:
+            offset = u["update_id"] + 1
             msg = u.get("message") or u.get("edited_message")
             if msg and "text" in msg:
                 handle_command(msg["chat"]["id"], msg["text"])
 
-        # check stock
+        # Check all watches
         check_all_watches()
 
-        # sleep 5 seconds to avoid tight loop
+        # Self-ping to keep alive every 5 min (for Replit/Render)
+        try:
+            requests.get(f"http://{os.environ.get('REPL_SLUG', 'yourapp')}.repl.co/ping", timeout=5)
+        except:
+            pass
+
         time.sleep(5)
