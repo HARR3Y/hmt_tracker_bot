@@ -31,6 +31,9 @@ links = []
 notifications_on = True
 check_interval = 5  # in minutes
 
+# A global variable to hold the scheduler instance
+scheduler = None
+
 # ---------------- Command Handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -95,6 +98,9 @@ async def interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             minutes = int(context.args[0])
             check_interval = minutes
+            # Reschedule the job with the new interval
+            if scheduler:
+                scheduler.reschedule_job("link_checker", trigger=IntervalTrigger(minutes=check_interval))
             await update.message.reply_text(f"✅ Interval updated to {minutes} minutes.")
         except ValueError:
             await update.message.reply_text("❌ Invalid number.")
@@ -125,6 +131,14 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_links():
     if not links or not notifications_on:
         return
+    # Note: Using `asyncio.get_running_loop()` to check if loop is running
+    # This is not necessary for the code to run, but good practice for debugging
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        logger.error("❌ No running event loop found for check_links job.")
+        return
+
     async with httpx.AsyncClient() as client:
         for link in links:
             try:
@@ -138,6 +152,11 @@ async def check_links():
 
 # ---------------- Main Function ----------------
 def main():
+    """
+    This function sets up the application.
+    """
+    global scheduler
+
     # Build app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -151,10 +170,15 @@ def main():
     app.add_handler(CommandHandler("notify", notify))
     app.add_handler(CommandHandler("stats", stats))
 
-    # Scheduler
+    # We initialize the scheduler here, but don't start it yet.
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_links, trigger=IntervalTrigger(minutes=check_interval), id="link_checker")
-    scheduler.start()
+
+    # Add a startup hook to start the scheduler after the event loop begins
+    async def on_startup(app_instance):
+        logger.info("Starting scheduler...")
+        scheduler.start()
+    app.post_init = on_startup
 
     # Run webhook
     app.run_webhook(
